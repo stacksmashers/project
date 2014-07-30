@@ -17,53 +17,31 @@
 #include <netinet/ether.h>
 
 #define ETHERNET_HDR_LEN 14
+#define PACKETS_PER_FILE 100		// Store 100 packets per capture file
 
 pfring *handle;				// pfring Session handle
-int filenumber = 1;				// global file number
+pcap_dumper_t *dumper = NULL;		// PCAP dump handler
+int filenumber = 1;			// global file number
 char filenameprefix[] = "capture-";	// global file name prefix
-char filename[20];			// global file name (combination of prefix + number)
-FILE *capfile;				// global file pointer
-
+char filename[30];			// global file name (combination of prefix + number)
 
 void sigproc(int sig) {
 
 	pfring_close(handle);
-	close(capfile);
-	printf("pfring closed.");
+	pfring_breakloop(handle);
+	pcap_dump_close(dumper);
+
+	printf("\nSniffer closed. %d files written to disk.\n",filenumber);
 
  	exit(0);
 }
 
 void makefilename()
 {
-	sprintf(filename,"%s%d",filenameprefix,filenumber);
+	sprintf(filename,"%s%d.pcap",filenameprefix,filenumber);
 
-	printf("\nNEW FILE NAME: %s",filename);
+	printf("\nNEW FILE NAME: %s\n",filename);
 	fflush(stdout);
-}
-
-void parse_packet(const struct pfring_pkthdr *packethdr, const u_char *packetptr, const u_char *args)
-{
-	static int packetno = 0;
-
-	packetno++;
-
-	if(packetno>=100)
-	{
-		packetno = 0;
-		close(capfile);
-
-		filenumber++;
-		makefilename();		
-		if((capfile=fopen(filename,"wb"))==NULL) {
-			printf("\nError opening %d th file.",filenumber);
-			exit(1);
-		}
-
-	}
-
-	fputs(packetptr,capfile);
-	fputs("\n---\n",capfile);
 }
 
 int main(int argc, char *argv[])
@@ -75,22 +53,19 @@ int main(int argc, char *argv[])
 	bpf_u_int32 mask;		// Our subnet mask
 	bpf_u_int32 net;		// Our network ID
 	struct pfring_pkthdr header;	// The header that pfring gives us 
-	const u_char *packet;		// The actual packet
-	int flags;			// Flags to pass for opening pfring instance
+	u_char *packet;			// The actual packet
+	int flags,num_pkts=0;		// Flags to pass for opening pfring instance, number of packets captured
 
+	memset(&header,0,sizeof(header));
 	signal(SIGINT,sigproc);
 
 	dev = argv[1];			// Set the device manually to arg[1]
+	printf("\nCapture device: %s\n", dev);
 
-  makefilename();
-
-	if((capfile = fopen(filename,"wb")) == NULL) {
-		printf("\nError opening capture file. Closing...");
-		return 1;
-	}
+	makefilename();
 
 	flags = PF_RING_PROMISC;
-	if((handle = pfring_open(dev, 500, flags)) == NULL) {  //MAX_CAPLEN instead of 500
+	if((handle = pfring_open(dev, 1520, flags)) == NULL) {  //MAX_CAPLEN instead of 1520
    		printf("pfring_open error");
     		return(-1);
   	} else {
@@ -98,11 +73,42 @@ int main(int argc, char *argv[])
 	}
 
 	pfring_enable_ring(handle);
-		
-	pfring_loop(handle,parse_packet,NULL,0);
-		
 
-	//pfring_close(handle);
-	
+	dumper = pcap_dump_open(pcap_open_dead(DLT_EN10MB, 16384), filename);	//16384 is MTU
+ 	if(dumper == NULL) {
+ 		printf("Unable to create dump file %s\n", filename);
+      		return(-1);
+    	}
+
+  	while(1) {
+		if(pfring_recv(handle, &packet, 0, &header, 1 ) > 0) {	//wait for packet, blocking call
+
+			if(num_pkts>=PACKETS_PER_FILE)
+			{
+				num_pkts = 0;
+				pcap_dump_close(dumper);
+
+				filenumber++;
+				makefilename();		
+
+				dumper = pcap_dump_open(pcap_open_dead(DLT_EN10MB, 16384), filename);
+		 		if(dumper == NULL) {
+		 			printf("Unable to create dump file %s\n", filename);
+		      			exit(1);
+		    		}
+
+			}
+
+			pcap_dump((u_char*)dumper, (struct pcap_pkthdr*)&header, packet);
+		  	fprintf(stdout, ".");
+		  	fflush(stdout);
+			
+			num_pkts++;
+    		}
+  	}
+
+	pcap_dump_close(dumper);
+	pfring_close(handle);
+			
 	return 0;
 }
